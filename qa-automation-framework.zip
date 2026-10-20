@@ -1,0 +1,798 @@
+"""
+ONE-SHOT SETUP: builds the whole QA automation framework project.
+
+USAGE
+    python setup_framework.py                    # creates ./qa-automation-framework
+    python setup_framework.py my-project-name    # creates ./my-project-name
+
+Then:
+    cd qa-automation-framework
+    python -m venv .venv && source .venv/bin/activate     # Windows: .venv\\Scripts\\activate
+    pip install -r requirements.txt
+    pytest
+"""
+
+import sys
+from pathlib import Path
+
+ROOT = Path(sys.argv[1] if len(sys.argv) > 1 else "qa-automation-framework")
+FILES = {}
+
+# ==========================================================================
+# Project config
+# ==========================================================================
+FILES["requirements.txt"] = r'''
+selenium>=4.20
+pytest>=8.0
+pytest-rerunfailures>=14.0
+pytest-xdist>=3.5
+allure-pytest>=2.13
+'''
+
+FILES["pytest.ini"] = r'''
+[pytest]
+testpaths = tests
+pythonpath = .
+addopts = -ra --reruns 1 --reruns-delay 1 --alluredir=reports/allure-results
+markers =
+    smoke: fast, critical-path tests
+    regression: broader coverage tests
+'''
+
+FILES[".gitignore"] = r'''
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+.idea/
+.vscode/
+logs/
+reports/
+screenshots/
+'''
+
+FILES["config/environments.json"] = r'''
+{
+  "qa": {
+    "base_url": "https://www.saucedemo.com",
+    "timeout": 10,
+    "username": "standard_user",
+    "password": "secret_sauce"
+  },
+  "staging": {
+    "base_url": "https://www.saucedemo.com",
+    "timeout": 15,
+    "username": "standard_user",
+    "password": "secret_sauce"
+  }
+}
+'''
+
+# ==========================================================================
+# Test data (data-driven tests read these)
+# ==========================================================================
+FILES["test_data/login_negative.csv"] = r'''
+case,username,password,expected_error
+bad-password,standard_user,wrong_password,Username and password do not match
+bad-username,not_a_user,secret_sauce,Username and password do not match
+empty-username,,secret_sauce,Username is required
+empty-password,standard_user,,Password is required
+locked-out-user,locked_out_user,secret_sauce,this user has been locked out
+'''
+
+FILES["test_data/checkout.json"] = r'''
+{
+  "valid_customer": {
+    "first_name": "Jane",
+    "last_name": "Doe",
+    "postal_code": "90210"
+  },
+  "invalid_customers": [
+    {
+      "case": "missing-first-name",
+      "first_name": "",
+      "last_name": "Doe",
+      "postal_code": "12345",
+      "error": "First Name is required"
+    },
+    {
+      "case": "missing-last-name",
+      "first_name": "Jane",
+      "last_name": "",
+      "postal_code": "12345",
+      "error": "Last Name is required"
+    },
+    {
+      "case": "missing-postal-code",
+      "first_name": "Jane",
+      "last_name": "Doe",
+      "postal_code": "",
+      "error": "Postal Code is required"
+    }
+  ]
+}
+'''
+
+# ==========================================================================
+# Utilities
+# ==========================================================================
+FILES["utils/__init__.py"] = ""
+
+FILES["utils/logger.py"] = r'''
+"""Central logging: every logger is a child of 'qa' and writes to console + logs/test_run.log."""
+
+import logging
+from pathlib import Path
+
+LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
+_FORMAT = "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"
+_configured = False
+
+
+def _setup():
+    LOG_DIR.mkdir(exist_ok=True)
+    root = logging.getLogger("qa")
+    root.setLevel(logging.INFO)
+    root.propagate = False
+    formatter = logging.Formatter(_FORMAT)
+
+    file_handler = logging.FileHandler(LOG_DIR / "test_run.log", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+
+    root.addHandler(file_handler)
+    root.addHandler(console_handler)
+
+
+def get_logger(name=None):
+    global _configured
+    if not _configured:
+        _setup()
+        _configured = True
+    return logging.getLogger("qa" if not name else f"qa.{name}")
+'''
+
+FILES["utils/config_loader.py"] = r'''
+"""Loads settings for the chosen environment from config/environments.json."""
+
+import json
+import os
+from pathlib import Path
+
+CONFIG_FILE = Path(__file__).resolve().parent.parent / "config" / "environments.json"
+
+
+def load_config(env):
+    with open(CONFIG_FILE, encoding="utf-8") as f:
+        all_envs = json.load(f)
+
+    if env not in all_envs:
+        raise ValueError(f"Unknown environment '{env}'. Available: {', '.join(all_envs)}")
+
+    config = {"env": env, **all_envs[env]}
+    # Secrets can be overridden from the environment (e.g. CI secrets) instead of the file
+    config["password"] = os.getenv("APP_PASSWORD", config["password"])
+    return config
+'''
+
+FILES["utils/data_reader.py"] = r'''
+"""Helpers for reading test data files from /test_data."""
+
+import csv
+import json
+from pathlib import Path
+
+DATA_DIR = Path(__file__).resolve().parent.parent / "test_data"
+
+
+def read_json(filename):
+    with open(DATA_DIR / filename, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def read_csv(filename):
+    """Returns a list of dicts, one per row, keyed by the header names."""
+    with open(DATA_DIR / filename, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+'''
+
+FILES["utils/driver_factory.py"] = r'''
+"""Creates a configured WebDriver for chrome, firefox or edge."""
+
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.edge.options import Options as EdgeOptions
+from selenium.webdriver.firefox.options import Options as FirefoxOptions
+
+
+def create_driver(browser="chrome", headless=False):
+    browser = browser.lower()
+
+    if browser == "chrome":
+        options = ChromeOptions()
+        if headless:
+            options.add_argument("--headless=new")
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-search-engine-choice-screen")
+        options.add_experimental_option(
+            "prefs",
+            {"credentials_enable_service": False, "profile.password_manager_enabled": False},
+        )
+        driver = webdriver.Chrome(options=options)
+
+    elif browser == "firefox":
+        options = FirefoxOptions()
+        if headless:
+            options.add_argument("-headless")
+        driver = webdriver.Firefox(options=options)
+        driver.set_window_size(1920, 1080)
+
+    elif browser == "edge":
+        options = EdgeOptions()
+        if headless:
+            options.add_argument("--headless=new")
+        options.add_argument("--window-size=1920,1080")
+        driver = webdriver.Edge(options=options)
+
+    else:
+        raise ValueError(f"Unsupported browser: {browser}")
+
+    driver.implicitly_wait(0)  # explicit waits only, never mix the two
+    return driver
+'''
+
+# ==========================================================================
+# Page objects
+# ==========================================================================
+FILES["pages/__init__.py"] = ""
+
+FILES["pages/base_page.py"] = r'''
+from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
+from utils.logger import get_logger
+
+
+class BasePage:
+    """Shared helpers. Every page object extends this."""
+
+    def __init__(self, driver, timeout=10):
+        self.driver = driver
+        self.wait = WebDriverWait(driver, timeout)
+        self.log = get_logger(self.__class__.__name__)
+
+    def find(self, locator):
+        return self.wait.until(EC.visibility_of_element_located(locator))
+
+    def find_all(self, locator):
+        self.find(locator)  # wait for at least one
+        return self.driver.find_elements(*locator)
+
+    def click(self, locator):
+        self.log.info("Click %s", locator)
+        self.wait.until(EC.element_to_be_clickable(locator)).click()
+
+    def type(self, locator, text):
+        self.log.info("Type into %s", locator)  # text is not logged (could be a password)
+        element = self.find(locator)
+        element.clear()
+        element.send_keys(text)
+
+    def text_of(self, locator):
+        return self.find(locator).text
+
+    def is_visible(self, locator, timeout=3):
+        try:
+            WebDriverWait(self.driver, timeout).until(EC.visibility_of_element_located(locator))
+            return True
+        except TimeoutException:
+            return False
+'''
+
+FILES["pages/login_page.py"] = r'''
+import allure
+from selenium.webdriver.common.by import By
+
+from pages.base_page import BasePage
+
+
+class LoginPage(BasePage):
+    USERNAME = (By.ID, "user-name")
+    PASSWORD = (By.ID, "password")
+    SUBMIT = (By.ID, "login-button")
+    ERROR = (By.CSS_SELECTOR, "[data-test='error']")
+
+    @allure.step("Open login page")
+    def open(self, base_url):
+        self.log.info("Opening %s", base_url)
+        self.driver.get(base_url)
+        return self
+
+    @allure.step("Log in as '{username}'")
+    def login(self, username, password):
+        self.type(self.USERNAME, username)
+        self.type(self.PASSWORD, password)
+        self.click(self.SUBMIT)
+
+    def error_message(self):
+        return self.text_of(self.ERROR)
+
+    def is_loaded(self):
+        return self.is_visible(self.SUBMIT)
+'''
+
+FILES["pages/inventory_page.py"] = r'''
+import allure
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import Select
+
+from pages.base_page import BasePage
+
+
+class InventoryPage(BasePage):
+    TITLE = (By.CSS_SELECTOR, ".title")
+    ITEMS = (By.CSS_SELECTOR, ".inventory_item")
+    NAMES = (By.CSS_SELECTOR, ".inventory_item_name")
+    PRICES = (By.CSS_SELECTOR, ".inventory_item_price")
+    SORT = (By.CSS_SELECTOR, "[data-test='product-sort-container']")
+    ADD_BUTTONS = (By.CSS_SELECTOR, "button[data-test^='add-to-cart']")
+    REMOVE_BUTTONS = (By.CSS_SELECTOR, "button[data-test^='remove']")
+    CART_BADGE = (By.CSS_SELECTOR, ".shopping_cart_badge")
+    CART_LINK = (By.CSS_SELECTOR, ".shopping_cart_link")
+    MENU_BUTTON = (By.ID, "react-burger-menu-btn")
+    LOGOUT_LINK = (By.ID, "logout_sidebar_link")
+
+    def title(self):
+        return self.text_of(self.TITLE)
+
+    def item_count(self):
+        return len(self.find_all(self.ITEMS))
+
+    def names(self):
+        return [e.text for e in self.find_all(self.NAMES)]
+
+    def prices(self):
+        return [float(e.text.replace("$", "")) for e in self.find_all(self.PRICES)]
+
+    @allure.step("Sort products by '{option}'")
+    def sort_by(self, option):
+        """option: az | za | lohi | hilo"""
+        Select(self.find(self.SORT)).select_by_value(option)
+
+    @allure.step("Add first {n} items to cart")
+    def add_first_n_items(self, n):
+        for button in self.find_all(self.ADD_BUTTONS)[:n]:
+            button.click()
+
+    @allure.step("Remove first item from cart")
+    def remove_first_item(self):
+        self.find_all(self.REMOVE_BUTTONS)[0].click()
+
+    def cart_count(self):
+        badges = self.driver.find_elements(*self.CART_BADGE)
+        return int(badges[0].text) if badges else 0
+
+    @allure.step("Open cart")
+    def open_cart(self):
+        self.click(self.CART_LINK)
+
+    @allure.step("Log out")
+    def logout(self):
+        self.click(self.MENU_BUTTON)
+        self.click(self.LOGOUT_LINK)
+'''
+
+FILES["pages/cart_page.py"] = r'''
+import allure
+from selenium.webdriver.common.by import By
+
+from pages.base_page import BasePage
+
+
+class CartPage(BasePage):
+    LIST = (By.CSS_SELECTOR, ".cart_list")
+    ITEMS = (By.CSS_SELECTOR, ".cart_item")
+    CHECKOUT = (By.ID, "checkout")
+
+    def item_count(self):
+        self.find(self.LIST)
+        return len(self.driver.find_elements(*self.ITEMS))
+
+    @allure.step("Start checkout")
+    def checkout(self):
+        self.click(self.CHECKOUT)
+'''
+
+FILES["pages/checkout_page.py"] = r'''
+import allure
+from selenium.webdriver.common.by import By
+
+from pages.base_page import BasePage
+
+
+class CheckoutPage(BasePage):
+    FIRST_NAME = (By.ID, "first-name")
+    LAST_NAME = (By.ID, "last-name")
+    POSTAL_CODE = (By.ID, "postal-code")
+    CONTINUE = (By.ID, "continue")
+    FINISH = (By.ID, "finish")
+    ERROR = (By.CSS_SELECTOR, "[data-test='error']")
+    ITEM_TOTAL = (By.CSS_SELECTOR, ".summary_subtotal_label")
+    CONFIRMATION = (By.CSS_SELECTOR, ".complete-header")
+
+    @allure.step("Fill customer info")
+    def fill_info(self, first_name, last_name, postal_code):
+        self.type(self.FIRST_NAME, first_name)
+        self.type(self.LAST_NAME, last_name)
+        self.type(self.POSTAL_CODE, postal_code)
+        self.click(self.CONTINUE)
+
+    def item_total(self):
+        """Parses 'Item total: $39.98' into 39.98"""
+        return float(self.text_of(self.ITEM_TOTAL).split("$")[1])
+
+    @allure.step("Finish order")
+    def finish(self):
+        self.click(self.FINISH)
+
+    def error_message(self):
+        return self.text_of(self.ERROR)
+
+    def confirmation(self):
+        return self.text_of(self.CONFIRMATION)
+'''
+
+# ==========================================================================
+# conftest: options, fixtures, failure screenshots
+# ==========================================================================
+FILES["conftest.py"] = r'''
+import re
+from pathlib import Path
+
+import allure
+import pytest
+
+from pages.inventory_page import InventoryPage
+from pages.login_page import LoginPage
+from utils.config_loader import load_config
+from utils.driver_factory import create_driver
+from utils.logger import get_logger
+
+log = get_logger("conftest")
+SCREENSHOT_DIR = Path("screenshots")
+
+
+def pytest_addoption(parser):
+    parser.addoption("--env", default="qa", help="Environment from config/environments.json")
+    parser.addoption("--browser", default="chrome", choices=["chrome", "firefox", "edge"])
+    parser.addoption("--headless", action="store_true", default=False, help="Run without a UI")
+
+
+@pytest.hookimpl(tryfirst=True, hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Stores each phase's result on the test item so fixtures can see if it failed."""
+    outcome = yield
+    report = outcome.get_result()
+    setattr(item, f"rep_{report.when}", report)
+
+
+@pytest.fixture(scope="session")
+def config(request):
+    cfg = load_config(request.config.getoption("--env"))
+    log.info("Running against env '%s' (%s)", cfg["env"], cfg["base_url"])
+    return cfg
+
+
+@pytest.fixture(autouse=True)
+def log_test_boundaries(request):
+    log.info("START %s", request.node.nodeid)
+    yield
+    log.info("END   %s", request.node.nodeid)
+
+
+@pytest.fixture
+def driver(request, config):
+    browser = request.config.getoption("--browser")
+    headless = request.config.getoption("--headless")
+    drv = create_driver(browser, headless)
+
+    yield drv
+
+    call_report = getattr(request.node, "rep_call", None)
+    if call_report is not None and call_report.failed:
+        SCREENSHOT_DIR.mkdir(exist_ok=True)
+        safe_name = re.sub(r"[^\w.\-]", "_", request.node.name)
+        png = drv.get_screenshot_as_png()
+        (SCREENSHOT_DIR / f"{safe_name}.png").write_bytes(png)
+        allure.attach(png, name="failure_screenshot", attachment_type=allure.attachment_type.PNG)
+        allure.attach(drv.current_url, name="url_at_failure", attachment_type=allure.attachment_type.TEXT)
+        log.error("FAILED %s -> screenshot saved", request.node.nodeid)
+
+    drv.quit()
+
+
+@pytest.fixture
+def inventory_page(driver, config):
+    """A browser already logged in and sitting on the inventory page."""
+    timeout = config["timeout"]
+    LoginPage(driver, timeout).open(config["base_url"]).login(config["username"], config["password"])
+    page = InventoryPage(driver, timeout)
+    assert page.title() == "Products", "Precondition failed: login did not reach inventory"
+    return page
+'''
+
+# ==========================================================================
+# Tests
+# ==========================================================================
+FILES["tests/test_login.py"] = r'''
+import allure
+import pytest
+
+from pages.inventory_page import InventoryPage
+from pages.login_page import LoginPage
+from utils.data_reader import read_csv
+
+NEGATIVE_CASES = read_csv("login_negative.csv")
+
+
+@allure.feature("Login")
+class TestLogin:
+    @pytest.mark.smoke
+    def test_valid_login(self, driver, config):
+        LoginPage(driver, config["timeout"]).open(config["base_url"]).login(
+            config["username"], config["password"]
+        )
+        assert InventoryPage(driver, config["timeout"]).title() == "Products"
+        assert "/inventory.html" in driver.current_url
+
+    @pytest.mark.regression
+    @pytest.mark.parametrize("case", NEGATIVE_CASES, ids=[c["case"] for c in NEGATIVE_CASES])
+    def test_invalid_login(self, driver, config, case):
+        page = LoginPage(driver, config["timeout"]).open(config["base_url"])
+        page.login(case["username"], case["password"])
+        assert case["expected_error"] in page.error_message()
+
+    @pytest.mark.regression
+    def test_logout_returns_to_login(self, driver, config, inventory_page):
+        inventory_page.logout()
+        assert LoginPage(driver, config["timeout"]).is_loaded()
+'''
+
+FILES["tests/test_inventory.py"] = r'''
+import allure
+import pytest
+
+
+@allure.feature("Inventory")
+class TestInventory:
+    @pytest.mark.smoke
+    def test_inventory_shows_six_products(self, inventory_page):
+        assert inventory_page.item_count() == 6
+
+    @pytest.mark.regression
+    @pytest.mark.parametrize(
+        "option, getter, reverse",
+        [
+            ("az", "names", False),
+            ("za", "names", True),
+            ("lohi", "prices", False),
+            ("hilo", "prices", True),
+        ],
+        ids=["name-a-z", "name-z-a", "price-low-high", "price-high-low"],
+    )
+    def test_sorting(self, inventory_page, option, getter, reverse):
+        inventory_page.sort_by(option)
+        values = getattr(inventory_page, getter)()
+        assert values == sorted(values, reverse=reverse)
+
+    @pytest.mark.regression
+    @pytest.mark.parametrize("n", [1, 3, 6])
+    def test_cart_badge_matches_items_added(self, inventory_page, n):
+        assert inventory_page.cart_count() == 0
+        inventory_page.add_first_n_items(n)
+        assert inventory_page.cart_count() == n
+
+    @pytest.mark.regression
+    def test_removing_item_updates_badge(self, inventory_page):
+        inventory_page.add_first_n_items(2)
+        inventory_page.remove_first_item()
+        assert inventory_page.cart_count() == 1
+'''
+
+FILES["tests/test_checkout.py"] = r'''
+import allure
+import pytest
+
+from pages.cart_page import CartPage
+from pages.checkout_page import CheckoutPage
+from utils.data_reader import read_json
+
+DATA = read_json("checkout.json")
+INVALID_CUSTOMERS = DATA["invalid_customers"]
+
+
+def go_to_checkout(driver, config, inventory_page, items=1):
+    """Shared setup: add items, open cart, click checkout."""
+    inventory_page.add_first_n_items(items)
+    inventory_page.open_cart()
+    cart = CartPage(driver, config["timeout"])
+    assert cart.item_count() == items
+    cart.checkout()
+    return CheckoutPage(driver, config["timeout"])
+
+
+@allure.feature("Checkout")
+class TestCheckout:
+    @pytest.mark.smoke
+    def test_complete_purchase(self, driver, config, inventory_page):
+        expected_total = round(sum(inventory_page.prices()[:2]), 2)
+        checkout = go_to_checkout(driver, config, inventory_page, items=2)
+
+        customer = DATA["valid_customer"]
+        checkout.fill_info(customer["first_name"], customer["last_name"], customer["postal_code"])
+
+        assert checkout.item_total() == expected_total
+        checkout.finish()
+        assert checkout.confirmation() == "Thank you for your order!"
+
+    @pytest.mark.regression
+    @pytest.mark.parametrize(
+        "customer", INVALID_CUSTOMERS, ids=[c["case"] for c in INVALID_CUSTOMERS]
+    )
+    def test_checkout_validation(self, driver, config, inventory_page, customer):
+        checkout = go_to_checkout(driver, config, inventory_page)
+        checkout.fill_info(customer["first_name"], customer["last_name"], customer["postal_code"])
+        assert customer["error"] in checkout.error_message()
+'''
+
+# ==========================================================================
+# CI
+# ==========================================================================
+FILES[".github/workflows/ui-tests.yml"] = r'''
+name: UI Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests (headless, 2 parallel workers)
+        run: pytest --headless -n 2
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            reports/allure-results
+            screenshots
+            logs
+'''
+
+# ==========================================================================
+# README
+# ==========================================================================
+FILES["README.md"] = r'''
+# QA Automation Framework
+
+A Selenium + Pytest UI test framework using the Page Object Model, with data-driven tests,
+Allure reporting, failure screenshots, logging, retries, parallel execution and CI.
+
+**Application under test:** [SauceDemo](https://www.saucedemo.com), a public demo e-commerce site.
+
+## Features
+
+| Feature | How it's done |
+|---|---|
+| Page Object Model | `pages/` with a shared `BasePage` (explicit waits, logging) |
+| Data-driven tests | CSV and JSON files in `test_data/`, fed to `pytest.mark.parametrize` |
+| Multi-environment config | `config/environments.json`, chosen with `--env` |
+| Cross-browser | Chrome, Firefox, Edge via `--browser` |
+| Reporting | Allure (steps, failure screenshots, URL at failure) |
+| Logging | Console + `logs/test_run.log` |
+| Retries | `pytest-rerunfailures` (1 retry by default) |
+| Parallel runs | `pytest-xdist` (`-n auto`) |
+| Test tagging | `smoke` and `regression` markers |
+| CI | GitHub Actions workflow, runs headless on every push and PR |
+| Secrets | Password can be overridden with the `APP_PASSWORD` environment variable |
+
+## Project structure
+
+```
+qa-automation-framework/
+├── .github/workflows/ui-tests.yml   # CI pipeline
+├── config/environments.json         # per-environment settings
+├── pages/                           # page objects
+│   ├── base_page.py
+│   ├── login_page.py
+│   ├── inventory_page.py
+│   ├── cart_page.py
+│   └── checkout_page.py
+├── test_data/                       # CSV / JSON test data
+├── tests/                           # test cases
+├── utils/                           # logger, config loader, data reader, driver factory
+├── conftest.py                      # CLI options, fixtures, failure screenshots
+├── pytest.ini                       # markers and default options
+└── requirements.txt
+```
+
+## Setup
+
+```bash
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+Selenium 4.6+ downloads the right browser driver automatically.
+
+## Running tests
+
+```bash
+pytest                                  # everything, Chrome, visible browser
+pytest --headless                       # no UI
+pytest -m smoke                         # only smoke tests
+pytest -m regression                    # only regression tests
+pytest --browser firefox                # another browser
+pytest --env staging                    # another environment
+pytest -n auto --headless               # parallel
+pytest -k checkout                      # tests matching a name
+```
+
+## Reports
+
+Results are written to `reports/allure-results` on every run. To view the report you need the
+[Allure command line tool](https://allurereport.org/docs/install/):
+
+```bash
+allure serve reports/allure-results
+```
+
+Failure screenshots are also saved to `screenshots/` and logs to `logs/test_run.log`.
+
+## Adding a new test
+
+1. Add a page object in `pages/` if the test needs a new page (extend `BasePage`).
+2. Add the test in `tests/` and tag it with `@pytest.mark.smoke` or `@pytest.mark.regression`.
+3. For data-driven cases, add rows to a file in `test_data/` and load them with `utils/data_reader.py`.
+
+## Design decisions
+
+- **Explicit waits only.** Implicit waits are disabled, because mixing the two causes unpredictable timeouts.
+- **Fixtures own setup and teardown.** Tests never create or quit drivers themselves.
+- **Test data lives outside the code**, so adding a case means adding a row, not writing a test.
+- **Passwords are never logged.** `BasePage.type` logs the locator but not the text.
+'''
+
+
+def main():
+    for relative_path, content in FILES.items():
+        path = ROOT / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content.lstrip("\n"), encoding="utf-8")
+    print(f"Created {len(FILES)} files in ./{ROOT}")
+    print(f"Next:  cd {ROOT}  &&  pip install -r requirements.txt  &&  pytest")
+
+
+if __name__ == "__main__":
+    main()
